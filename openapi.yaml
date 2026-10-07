@@ -5,7 +5,7 @@ info:
   version: 1.0.0
   description: |
     API for submitting investment instructions and retrieving
-    their current execution status. The instruction endpoints do not expose
+    their current financial processing status. The instruction endpoints do not expose
     generated orders, trades, or per-asset execution details.
 
     ## Conventions
@@ -41,7 +41,7 @@ info:
     | `PENDING` | Accepted and stored; processing has not started yet. | No |
     | `EXECUTING` | Processing has started. | No |
     | `PARTIALLY_COMPLETED` | Processing has finished, but only part of the instruction was completed. No further execution will occur for this instruction. | Yes |
-    | `COMPLETED` | The instruction completed successfully. | Yes |
+    | `COMPLETED` | The financial effect of the instruction was recorded successfully; this does not imply market execution. | Yes |
     | `FAILED` | The instruction could not be completed. | Yes |
 
     `REJECTED` is not an instruction lifecycle state. It is used only in
@@ -508,9 +508,9 @@ components:
           description: >
             Monetary amount of the instruction, in Rial.
 
-            INVEST (required): new cash to invest according to the plan.
+            INVEST (required): cash deposit to record in the investment account.
 
-            DIVEST (required): cash to raise for withdrawal. It must not exceed
+            DIVEST (required): withdrawal/debt to record in the investment account. It must not exceed
             the value available to sell, otherwise the instruction becomes
             FAILED.
 
@@ -993,8 +993,8 @@ components:
     InstructionType:
       type: string
       description: |
-        - `INVEST`: invest new cash according to a plan.
-        - `DIVEST`: raise cash from the account for withdrawal.
+        - `INVEST`: record a cash deposit in the investment account.
+        - `DIVEST`: record a withdrawal/debt in the investment account.
       enum:
         - INVEST
         - DIVEST
@@ -1010,8 +1010,8 @@ components:
         - `PARTIALLY_COMPLETED`: processing has finished, but only part of
           the instruction was completed. No further execution will occur for
           this instruction. This is a terminal status.
-        - `COMPLETED`: processing completed successfully in full. This is a
-          terminal status.
+        - `COMPLETED`: the financial effect was recorded successfully in full.
+          This is a terminal status and does not imply market execution.
         - `FAILED`: the instruction could not be completed. This is a terminal
           status.
 
