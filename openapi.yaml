@@ -2,17 +2,17 @@ openapi: 3.0.3
 
 info:
   title: Investment Instruction API
-  version: 2.0.0
+  version: 1.0.0
   description: |
     API for submitting investment instructions and retrieving
-    their current financial-posting status. The instruction endpoints do not expose
+    their current execution status. The instruction endpoints do not expose
     generated orders, trades, or per-asset execution details.
 
     ## Conventions
 
     - **Monetary unit.** Every monetary value in this API (`amount`,
       `price`, `lastMarketPrice`, `cashBalance`,
-      `investmentValue`, `sumInvest`, `sumDivest`) is an integer number of **Iranian Rial (IRR)**.
+      `investmentValue`) is an integer number of **Iranian Rial (IRR)**.
       Toman is never used.
     - **Money identity.** For an account, `investmentValue`
       equals `cashBalance` plus the sum of `quantity × lastMarketPrice` over
@@ -31,8 +31,8 @@ info:
     instruction was accepted and stored; it does not mean execution has
     completed. No push mechanism (webhooks or callbacks) exists. Clients
     track each accepted instruction with `GET /instructions/{instructionId}`
-    until it reaches a terminal status (`COMPLETED`
-    or `FAILED`).
+    until it reaches a terminal status (`COMPLETED`,
+    `PARTIALLY_COMPLETED`, or `FAILED`).
 
     ## Instruction status lifecycle
 
@@ -40,8 +40,9 @@ info:
     |---|---|---|
     | `PENDING` | Accepted and stored; processing has not started yet. | No |
     | `EXECUTING` | Processing has started. | No |
-    | `COMPLETED` | The full DEPOSIT or WITHDRAW financial effect was posted atomically. Market execution may still be pending. | Yes |
-    | `FAILED` | No financial effect was posted; processing failed. | Yes |
+    | `PARTIALLY_COMPLETED` | Processing has finished, but only part of the instruction was completed. No further execution will occur for this instruction. | Yes |
+    | `COMPLETED` | The instruction completed successfully. | Yes |
+    | `FAILED` | The instruction could not be completed. | Yes |
 
     `REJECTED` is not an instruction lifecycle state. It is used only in
     `POST /instructions/batch` results when an individual item is not accepted
@@ -53,43 +54,8 @@ info:
     |---|---|---|
     | `PENDING` | `EXECUTING` | Processing starts. |
     | `EXECUTING` | `COMPLETED` | Processing finishes and the instruction is completed in full. |
+    | `EXECUTING` | `PARTIALLY_COMPLETED` | Processing finishes after only part of the instruction could be completed; no further execution will occur. |
     | `PENDING`, `EXECUTING` | `FAILED` | A processing or business-rule failure prevents completion. |
-
-    INVEST posts a DEPOSIT; DIVEST posts a WITHDRAW, which may create a
-    negative cash balance (debt). Each instruction posts its financial effect
-    at most once and in full, atomically with its COMPLETED status. FAILED
-    leaves no financial effect. Market BUY/SELL transactions are produced by
-    an independent daily process and may span multiple business days. Neither
-    market execution nor payment settlement is implied by COMPLETED.
-    Mutations of the same account must be serialized: a DIVEST is checked
-    against the current net investmentValue, including previously posted debt,
-    and must not exceed it. Insufficient cash alone does not cause failure.
-    A supplied plan and any account creation are committed only with a
-    successful financial posting; FAILED leaves the account and plan unchanged.
-
-    ## Batch status and identity
-
-    A batch is an immutable submission envelope scoped to the authenticated
-    client. Reusing instructionBatchId with the same ordered payload is allowed;
-    item deduplication still applies. Reusing it with a different payload returns
-    HTTP 400 INVALID_REQUEST before any item is accepted. A new batch ID may
-    contain the same instruction IDs. Batch lookup aggregates only the items
-    accepted in the original submission and its original rejected results;
-    retries do not overwrite this membership or the original outcome. On an
-    identical retry, accepted items return REJECTED / DUPLICATE_INSTRUCTION and
-    originally rejected items retain their original rejection; retry a corrected
-    or previously rejected item in a new batch.
-
-    GET /instructions/batch/{instructionBatchId} uses InstructionBatchStatus,
-    independently of InstructionStatus. Evaluate these rules in order:
-    - PENDING: at least one accepted item exists and all accepted items are PENDING.
-    - EXECUTING: at least one accepted item is nonterminal and the first rule does not apply.
-    - COMPLETED: every submitted item was accepted and is COMPLETED.
-    - PARTIALLY_COMPLETED: all accepted items are terminal, at least one is
-      COMPLETED, and another item is FAILED or was REJECTED.
-    - FAILED: no item completed and all accepted items are terminal (including
-      a batch in which every item was rejected).
-    Batch completion never describes market execution.
 
     ## Plans
 
@@ -105,7 +71,7 @@ info:
       status `REJECTED` and an `error.code`. Clients must branch on `code`,
       not on the batch HTTP status.
     - JSON Schema violations map to specific codes where one exists:
-      a missing or null `amount` for INVEST or DIVEST → `AMOUNT_REQUIRED`;
+      a missing `amount` for INVEST or DIVEST → `AMOUNT_REQUIRED`;
       an `amount` below 1 → `INVALID_AMOUNT`. Every other
       schema violation (malformed JSON, a wrong type, a missing required
       field, an unknown property, an unknown enum value) →
@@ -140,12 +106,10 @@ info:
     - `PENDING`: the instruction was accepted by this submission and stored.
     - `REJECTED` with `DUPLICATE_INSTRUCTION`: an instruction with this ID
       already exists. The server does not check whether the payload is the
-      same. Only the owning client can retrieve an instruction, even though IDs
-      are globally unique. Call `GET /instructions/{instructionId}`: if the returned details
+      same. Call `GET /instructions/{instructionId}`: if the returned details
       match the submitted item, an earlier attempt succeeded and nothing more
-      is needed. If details differ or access is denied, stop and reconcile the
-      collision with support; do not blindly submit the financial operation
-      under a new ID, which could post the same economic intent twice.
+      is needed; otherwise the ID collides with another instruction and a new
+      `instructionId` must be used.
 
     ## Known limitations of this version
 
@@ -176,28 +140,13 @@ paths:
         accepted. A batch containing a single instruction is valid. See
         *Errors* and *Retries and idempotency* for submission and retry rules.
 
-        A valid batch envelope returns HTTP status 207, with one result per
+        The response always has HTTP status 207, with one result per
         submitted instruction, in the same order as the request. Check
         each result's `status` field rather than the HTTP status.
 
-        HTTP 400 is returned for invalid batch envelopes, conflicting batch ID
-        reuse or a verifiable control-total mismatch. A malformed envelope is (not an object, invalid or missing instructionBatchId,
-        unknown top-level field, or missing, non-array or empty instructions).
-        Validate the envelope first, then each item independently; do not apply
-        whole-document schema rejection to item violations. A malformed item
-        receives REJECTED / INVALID_REQUEST (or the specific amount code).
-        If its instructionId is missing, wrongly typed or outside the positive
-        int64 range, its result has instructionId: null; match by array position.
-
-        sumInvest and sumDivest are optional informational control totals in IRR,
-        computed over all submitted INVEST and DIVEST amounts respectively,
-        before acceptance. They do not represent accepted or executed totals.
-        When supplied and all items of that type have valid amounts, a mismatch
-        returns HTTP 400 INVALID_REQUEST before storing anything. If a total
-        cannot be computed because an item is invalid, skip that type's total
-        comparison and reject the invalid item independently. An item with an
-        unknown or missing instructionType makes both totals unverifiable.
-        Invalid types or ranges on the total fields themselves are envelope errors.
+        HTTP 400 is only returned when the batch request itself is
+        malformed (not a JSON array, or an empty one); it does not
+        reflect the outcome of any individual instruction.
 
       requestBody:
         required: true
@@ -253,9 +202,8 @@ paths:
         '400':
           description: >
             The batch request itself is malformed. Covers schema
-            validation errors of the envelope, such as a missing or empty
-            instructions array, conflicting batch ID reuse, invalid control
-            totals or a verifiable total mismatch. No item is stored.
+            validation errors of the request body, such as a missing or
+            empty instructions array.
           content:
             application/json:
               schema:
@@ -271,8 +219,7 @@ paths:
       summary: Get instruction batch status
       description: >
         Returns the current batch-level status. No generated order or execution
-        detail is returned. See Batch status and identity for aggregation rules.
-        An invalid instructionBatchId returns HTTP 400 with
+        detail is returned. An invalid instructionBatchId returns HTTP 400 with
         INVALID_REQUEST.
 
       parameters:
@@ -284,13 +231,9 @@ paths:
           schema:
             type: integer
             format: int64
-            maximum: 9223372036854775807
             minimum: 1
 
       responses:
-
-        '400':
-          $ref: '#/components/responses/InvalidRequest'
 
         '200':
           description: Instruction batch status
@@ -317,7 +260,7 @@ paths:
   /instructions/{instructionId}:
     get:
       operationId: getInstruction
-      summary: Get instruction details and financial-posting status
+      summary: Get instruction details and execution status
       description: >
         Returns the submitted instruction fields and its current instruction-level
         status. Generated orders, trades, and per-asset execution details are not
@@ -332,13 +275,9 @@ paths:
           schema:
             type: integer
             format: int64
-            maximum: 9223372036854775807
             minimum: 1
 
       responses:
-
-        '400':
-          $ref: '#/components/responses/InvalidRequest'
 
         '200':
           description: Instruction details and current status
@@ -350,7 +289,7 @@ paths:
               example:
                 instructionId: 100001
                 investmentId: 200001
-                instructionType: INVEST
+                instructionType: BUY
                 amount: 50000000
                 investmentPlanId: 300002
                 status: COMPLETED
@@ -385,13 +324,9 @@ paths:
           schema:
             type: integer
             format: int64
-            maximum: 9223372036854775807
             minimum: 1
 
       responses:
-
-        '400':
-          $ref: '#/components/responses/InvalidRequest'
 
         '200':
           description: Investment account details
@@ -449,7 +384,6 @@ paths:
           schema:
             type: integer
             format: int64
-            maximum: 9223372036854775807
             minimum: 1
 
         - name: from
@@ -461,7 +395,6 @@ paths:
           schema:
             type: string
             format: date-time
-            pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$'
 
         - name: to
           in: query
@@ -472,12 +405,8 @@ paths:
           schema:
             type: string
             format: date-time
-            pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$'
 
       responses:
-
-        '400':
-          $ref: '#/components/responses/InvalidRequest'
 
         '200':
           description: Transactions within the specified date range
@@ -526,17 +455,6 @@ paths:
 
 components:
 
-  responses:
-    InvalidRequest:
-      description: Invalid path or query parameter.
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/ErrorResponse'
-          example:
-            code: INVALID_REQUEST
-            message: A path or query parameter is invalid.
-
   schemas:
 
     InstructionRequest:
@@ -553,7 +471,6 @@ components:
         instructionId:
           type: integer
           format: int64
-          maximum: 9223372036854775807
           minimum: 1
           description: >
             Client-generated unique identifier of the instruction. It acts
@@ -569,7 +486,6 @@ components:
         investmentId:
           type: integer
           format: int64
-          maximum: 9223372036854775807
           minimum: 1
           description: >
             Identifier of the investment account.
@@ -586,33 +502,29 @@ components:
 
         amount:
           type: integer
+          nullable: true
           format: int64
-          maximum: 9223372036854775807
           minimum: 1
           description: >
             Monetary amount of the instruction, in Rial.
 
             INVEST (required): new cash to invest according to the plan.
 
-            DIVEST (required): financial withdrawal to post, possibly creating
-            cash debt. It must not exceed the current net investmentValue at
-            processing time, otherwise the instruction becomes FAILED with no
-            financial effect. Sales to cover debt happen independently later.
+            DIVEST (required): cash to raise for withdrawal. It must not exceed
+            the value available to sell, otherwise the instruction becomes
+            FAILED.
 
 
         investmentPlanId:
           type: integer
           nullable: true
           format: int64
-          maximum: 9223372036854775807
           minimum: 1
           description: >
             Default investment plan of the investment account.
 
-            When provided and non-null, this plan becomes the default plan of
-            the investment account only when the instruction completes.
-            Null is treated as omitted and never clears an existing plan.
-            This applies to both INVEST and DIVEST.
+            When provided, this plan becomes the default plan of the
+            investment account.
 
             When creating a new investment account, investmentPlanId is required.
 
@@ -649,7 +561,6 @@ components:
         - instructionId
         - investmentId
         - instructionType
-        - amount
         - status
 
       properties:
@@ -657,23 +568,18 @@ components:
         instructionId:
           type: integer
           format: int64
-          maximum: 9223372036854775807
-          minimum: 1
 
         investmentId:
           type: integer
           format: int64
-          maximum: 9223372036854775807
-          minimum: 1
 
         instructionType:
           $ref: '#/components/schemas/InstructionType'
 
         amount:
           type: integer
+          nullable: true
           format: int64
-          maximum: 9223372036854775807
-          minimum: 1
           description: >
             Total monetary amount of the instruction, in Rial, as submitted.
 
@@ -681,8 +587,6 @@ components:
           type: integer
           nullable: true
           format: int64
-          maximum: 9223372036854775807
-          minimum: 1
           description: investmentPlanId as submitted; null when not provided.
 
         status:
@@ -702,11 +606,9 @@ components:
         instructionBatchId:
           type: integer
           format: int64
-          maximum: 9223372036854775807
-          minimum: 1
 
         status:
-          $ref: '#/components/schemas/InstructionBatchStatus'
+          $ref: '#/components/schemas/InstructionStatus'
 
     InstructionBatchRequest:
       type: object
@@ -721,30 +623,15 @@ components:
         instructionBatchId:
           type: integer
           format: int64
-          maximum: 9223372036854775807
           minimum: 1
           description: >
             Client-generated unique identifier of the batch request. It is
             echoed back in the response, for correlating the request with
             its result and for logging or support purposes. It does not
             affect deduplication: each instruction's own instructionId is
-            still the idempotency key. The same batch ID requires the same
-            ordered payload; changed payloads require a new batch ID.
-            See Batch status and identity for retry membership rules.
-
-        sumInvest:
-          type: integer
-          format: int64
-          maximum: 9223372036854775807
-          minimum: 0
-          description: Optional control total of submitted INVEST amounts in IRR; see batch rules.
-
-        sumDivest:
-          type: integer
-          format: int64
-          maximum: 9223372036854775807
-          minimum: 0
-          description: Optional control total of submitted DIVEST amounts in IRR; see batch rules.
+            still the idempotency key, so resubmitting the same batch
+            (whether under the same or a different instructionBatchId) is
+            safe.
 
         instructions:
           type: array
@@ -769,8 +656,6 @@ components:
         instructionBatchId:
           type: integer
           format: int64
-          maximum: 9223372036854775807
-          minimum: 1
           description: instructionBatchId as submitted.
 
         results:
@@ -801,10 +686,7 @@ components:
         instructionId:
           type: integer
           format: int64
-          maximum: 9223372036854775807
-          minimum: 1
-          nullable: true
-          description: Valid instructionId as submitted; null for an invalid or missing ID.
+          description: instructionId of the corresponding instruction in the request.
 
         status:
           $ref: '#/components/schemas/InstructionSubmissionStatus'
@@ -818,11 +700,6 @@ components:
             status:
               enum:
                 - PENDING
-            instructionId:
-              type: integer
-              format: int64
-              maximum: 9223372036854775807
-              minimum: 1
           not:
             required:
               - error
@@ -852,45 +729,35 @@ components:
         investmentId:
           type: integer
           format: int64
-          maximum: 9223372036854775807
-          minimum: 1
 
         investmentPlanId:
           type: integer
           nullable: true
           format: int64
-          maximum: 9223372036854775807
-          minimum: 1
           description: >
             Default investment plan of the investment account.
 
             May be null if no plan has been assigned. Accounts created
             through this API always have a default plan, because
-            investmentPlanId is required at creation. INVEST
+            investmentPlanId is required at creation. BUY
             instructions for an account without a default plan must provide
             a plan.
 
         cashBalance:
           type: integer
           format: int64
-          maximum: 9223372036854775807
-          minimum: -9223372036854775808
+          minimum: 0
           description: >
-            Signed ledger cash balance in Rial. A negative value represents
-            posted withdrawal debt awaiting cash coverage by asset sales;
-            this is not a measure of settled cash available for payment.
+            Cash balance available in the investment account, in Rial.
 
         investmentValue:
           type: integer
           format: int64
-          maximum: 9223372036854775807
-          minimum: -9223372036854775808
+          minimum: 0
           description: >
             Total value of the investment account, in Rial. Equal to the cash
             balance plus the market value (quantity × lastMarketPrice) of all
-            asset holdings. It may be negative if market losses exceed
-            the remaining asset value while withdrawal debt is outstanding.
-            DIVEST cannot post when this value is below the requested amount.
+            asset holdings.
 
         assets:
           type: array
@@ -902,7 +769,6 @@ components:
         timestamp:
           type: string
           format: date-time
-          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$'
           description: >
             Date and time this valuation was generated, in UTC.
 
@@ -932,7 +798,6 @@ components:
         quantity:
           type: integer
           format: int64
-          maximum: 9223372036854775807
           minimum: 0
           description: >
             Number of units of the symbol currently held.
@@ -940,7 +805,6 @@ components:
         lastMarketPrice:
           type: integer
           format: int64
-          maximum: 9223372036854775807
           minimum: 0
           description: >
             Last known market price per unit of the symbol, in Rial.
@@ -960,21 +824,18 @@ components:
         quantity:
           type: integer
           format: int64
-          maximum: 9223372036854775807
           minimum: 1
           description: Number of units traded.
 
         price:
           type: integer
           format: int64
-          maximum: 9223372036854775807
           minimum: 1
           description: Price per unit for this trade, in Rial.
 
         timestamp:
           type: string
           format: date-time
-          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$'
           description: Date and time the trade was executed, in UTC.
 
 
@@ -993,19 +854,15 @@ components:
         investmentId:
           type: integer
           format: int64
-          maximum: 9223372036854775807
-          minimum: 1
 
         from:
           type: string
           format: date-time
-          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$'
           description: Start of the requested date range (inclusive), in UTC.
 
         to:
           type: string
           format: date-time
-          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$'
           description: End of the requested date range (inclusive), in UTC.
 
         transactions:
@@ -1035,7 +892,6 @@ components:
         transactionId:
           type: integer
           format: int64
-          maximum: 9223372036854775807
           minimum: 1
           description: Unique identifier of the transaction.
 
@@ -1045,7 +901,6 @@ components:
         amount:
           type: integer
           format: int64
-          maximum: 9223372036854775807
           minimum: 1
           description: >
             Monetary value of the transaction, in Rial. For BUY and SELL it
@@ -1054,7 +909,6 @@ components:
         timestamp:
           type: string
           format: date-time
-          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$'
           description: Date and time the transaction took place, in UTC.
 
         trade:
@@ -1112,14 +966,12 @@ components:
         quantity:
           type: integer
           format: int64
-          maximum: 9223372036854775807
           minimum: 1
           description: Number of units traded.
 
         price:
           type: integer
           format: int64
-          maximum: 9223372036854775807
           minimum: 1
           description: Price per unit for this trade, in Rial.
 
@@ -1128,8 +980,7 @@ components:
       type: string
       description: |
         - `DEPOSIT`: cash added to the account.
-        - `WITHDRAW`: withdrawal posted to the ledger; may create cash debt.
-          It does not establish that an external payout has settled.
+        - `WITHDRAW`: cash taken out of the account.
         - `BUY`: units of an asset bought.
         - `SELL`: units of an asset sold.
       enum:
@@ -1142,8 +993,8 @@ components:
     InstructionType:
       type: string
       description: |
-        - `INVEST`: post a DEPOSIT; subsequent purchases use the account plan.
-        - `DIVEST`: post a WITHDRAW; subsequent sales cover any cash debt.
+        - `INVEST`: invest new cash according to a plan.
+        - `DIVEST`: raise cash from the account for withdrawal.
       enum:
         - INVEST
         - DIVEST
@@ -1152,29 +1003,25 @@ components:
     InstructionStatus:
       type: string
       description: |
-        Atomic financial-posting status, independent of market execution.
-        PENDING waits for processing; EXECUTING is processing.
-        COMPLETED means the full DEPOSIT or WITHDRAW and any account/plan
-        changes were committed once. FAILED means none were committed.
-        COMPLETED and FAILED are terminal; neither implies settlement.
-      enum:
-        - PENDING
-        - EXECUTING
-        - COMPLETED
-        - FAILED
+        Instruction-level processing status.
 
-    InstructionBatchStatus:
-      type: string
-      description: >
-        Aggregate of original submission outcomes and current accepted-item
-        statuses. See Batch status and identity for ordered aggregation rules.
-        PARTIALLY_COMPLETED is terminal only at batch level and never means
-        a partially posted instruction or partially executed market order.
+        - `PENDING`: accepted and stored; processing has not started yet.
+        - `EXECUTING`: processing has started.
+        - `PARTIALLY_COMPLETED`: processing has finished, but only part of
+          the instruction was completed. No further execution will occur for
+          this instruction. This is a terminal status.
+        - `COMPLETED`: processing completed successfully in full. This is a
+          terminal status.
+        - `FAILED`: the instruction could not be completed. This is a terminal
+          status.
+
+        These statuses are intentionally instruction-level. The API does not
+        expose the generated orders or their individual execution states.
       enum:
         - PENDING
         - EXECUTING
-        - COMPLETED
         - PARTIALLY_COMPLETED
+        - COMPLETED
         - FAILED
 
     InstructionSubmissionStatus:
@@ -1214,23 +1061,21 @@ components:
         Machine-readable error code. Clients must branch on this value
         rather than on the HTTP status.
 
-        - `INVALID_REQUEST` (400 for envelope/path/query errors; 207 item
-          error for an invalid instruction): the request does not match the
-          schema and no more specific code applies. Also covers conflicting
-          batch ID reuse and verifiable control-total mismatches.
-        - `AMOUNT_REQUIRED` (207 item error): `amount` is missing or null for INVEST or DIVEST.
-        - `INVALID_AMOUNT` (207 item error): `amount` is below 1.
-        - `DUPLICATE_INSTRUCTION` (207 item error): `instructionId` already exists.
+        - `INVALID_REQUEST` (400): the request does not match the schema,
+          or a path or query parameter is invalid, and no more specific
+          code applies.
+        - `AMOUNT_REQUIRED` (400): `amount` is missing for INVEST or DIVEST.
+        - `INVALID_AMOUNT` (400): `amount` is below 1.
+        - `DUPLICATE_INSTRUCTION` (400): `instructionId` already exists.
           See *Retries and idempotency*.
-        - `INVESTMENT_PLAN_NOT_FOUND` (207 item error): `investmentPlanId` does not
+        - `INVESTMENT_PLAN_NOT_FOUND` (400): `investmentPlanId` does not
           refer to an existing plan.
-        - `INVESTMENT_PLAN_REQUIRED` (207 item error): no plan could be resolved,
+        - `INVESTMENT_PLAN_REQUIRED` (400): no plan could be resolved,
           either because an INVEST creates a new account without
           `investmentPlanId`, or because the account has no default plan.
-        - `INVESTMENT_NOT_FOUND` (207 item error on POST, 404 on GET): the investment
+        - `INVESTMENT_NOT_FOUND` (400 on POST, 404 on GET): the investment
           account does not exist.
         - `INSTRUCTION_NOT_FOUND` (404): the instruction does not exist.
-        - `INSTRUCTION_BATCH_NOT_FOUND` (404): the batch does not exist.
       enum:
         - DUPLICATE_INSTRUCTION
         - INVESTMENT_PLAN_NOT_FOUND
