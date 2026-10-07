@@ -289,7 +289,7 @@ paths:
               example:
                 instructionId: 100001
                 investmentId: 200001
-                instructionType: BUY
+                instructionType: INVEST
                 amount: 50000000
                 investmentPlanId: 300002
                 status: COMPLETED
@@ -739,7 +739,7 @@ components:
 
             May be null if no plan has been assigned. Accounts created
             through this API always have a default plan, because
-            investmentPlanId is required at creation. BUY
+            investmentPlanId is required at creation. INVEST
             instructions for an account without a default plan must provide
             a plan.
 
